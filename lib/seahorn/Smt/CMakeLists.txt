@@ -17,3 +17,7 @@ if (YICES2_FOUND)
   target_link_libraries(SeaSmt PRIVATE ${YICES2_LIBRARY})
 endif()
 
+if (BITWUZLA_FOUND)
+  target_link_libraries(SeaSmt PRIVATE ${BITWUZLA_LIBRARY})
+endif()
+

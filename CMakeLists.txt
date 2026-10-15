@@ -174,6 +174,20 @@ if (YICES2_FOUND)
   install(FILES ${YICES2_LIBRARY} DESTINATION lib)
 endif()  
 
+# Find Bitwuzla. Unlike Yices, it is searched for only when BITWUZLA_HOME is
+# set, so installing Bitwuzla system-wide does not change a build that did not
+# ask for it. For a system-wide install pass e.g. -DBITWUZLA_HOME=/usr.
+set(BITWUZLA_HOME "" CACHE PATH
+  "Bitwuzla installation directory. Setting it enables the Bitwuzla backend.")
+if (BITWUZLA_HOME)
+  find_package(Bitwuzla 0.9 REQUIRED)
+  add_definitions(-DWITH_BITWUZLA)
+  include_directories(${BITWUZLA_INCLUDE_DIR})
+  message("Found Bitwuzla library: ${BITWUZLA_LIBRARY} (version ${BITWUZLA_VERSION})")
+  # The library is not installed; the installed seahorn loads it from
+  # BITWUZLA_HOME.
+endif()
+
 # LLVM 15 (Ubuntu package) exposes zstd::libzstd_shared in its export set.
 # Pull in zstd's imported targets first so find_package(LLVM) can resolve it.
 find_package (zstd QUIET)
