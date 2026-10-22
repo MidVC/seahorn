@@ -1,5 +1,6 @@
 add_llvm_library (SeaSmt DISABLE_LLVM_LINK_LLVM_DYLIB
   MarshalYices.cc
+  MarshalBitwuzla.cc
   Yices2SolverImpl.cc
   Yices2ModelImpl.cc
   ExprToZ.cc
@@ -20,4 +21,9 @@ endif()
 if (BITWUZLA_FOUND)
   target_link_libraries(SeaSmt PRIVATE ${BITWUZLA_LIBRARY})
 endif()
+
+# Bitwuzla reports errors with C++ exceptions. LLVM, and so SeaHorn, may be
+# built with -fno-exceptions; the Bitwuzla files catch them all themselves.
+set_source_files_properties(MarshalBitwuzla.cc PROPERTIES
+  COMPILE_FLAGS -fexceptions)
 
