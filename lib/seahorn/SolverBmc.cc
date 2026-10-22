@@ -44,8 +44,8 @@ SolverBmcEngine::SolverBmcEngine(OperationalSemantics &sem,
   } else if (m_solver_kind == solver::SolverKind::BITWUZLA) {
     LOG("bmc", INFO << "bmc using Bitwuzla";);
 #ifdef WITH_BITWUZLA
-    ERR << "The Bitwuzla solver adapter is not implemented yet";
-    std::exit(1);
+    m_new_smt_solver =
+        std::make_unique<solver::bitwuzla_solver_impl>(sem.efac());
 #else
     ERR << "No Bitwuzla found. Compile SeaHorn with BITWUZLA_HOME option!";
     std::exit(1);
