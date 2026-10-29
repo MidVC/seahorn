@@ -13,10 +13,6 @@
 #include "seahorn/Expr/Smt/Yices2SolverImpl.hh"
 #endif
 
-#ifdef WITH_BITWUZLA
-#include "seahorn/Expr/Smt/BitwuzlaSolverImpl.hh"
-#endif
-
 #include "seahorn/Analysis/CutPointGraph.hh"
 #include "seahorn/OperationalSemantics.hh"
 

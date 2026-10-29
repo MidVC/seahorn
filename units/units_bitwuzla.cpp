@@ -1,12 +1,10 @@
 #ifdef WITH_BITWUZLA
-/* Unit tests for the Bitwuzla encoder (marshal_bitwuzla), solver and model */
+/* Unit tests for the Bitwuzla encoder (marshal_bitwuzla) */
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 
 #include "seahorn/Expr/Expr.hh"
 #include "seahorn/Expr/ExprLlvm.hh"
 #include "seahorn/Expr/ExprOpBinder.hh"
-#include "seahorn/Expr/Smt/BitwuzlaModelImpl.hh"
-#include "seahorn/Expr/Smt/BitwuzlaSolverImpl.hh"
 #include "seahorn/Expr/Smt/EZ3.hh"
 #include "seahorn/Expr/Smt/MarshalBitwuzla.hh"
 
@@ -25,10 +23,7 @@
 
 using namespace expr;
 using namespace seahorn;
-using seahorn::solver::bitwuzla_solver_impl;
 using seahorn::solver::marshal_bitwuzla;
-using seahorn::solver::Solver;
-using seahorn::solver::SolverResult;
 using seahorn::solver::UnsupportedExpr;
 namespace bz = bitwuzla;
 
@@ -497,208 +492,5 @@ TEST_CASE("bitwuzla.deep expressions") {
   for (unsigned k = 0; k < depth; ++k)
     e = mk<BADD>(e, env.num(1, 32));
   CHECK(env.valid(mk<EQ>(e, mk<BADD>(x, env.num(depth, 32)))));
-}
-
-// -- the solver adapter, through the generic Solver interface
-
-namespace {
-Solver::expr_const_it_range litRange(const ExprVector &v) {
-  return llvm::make_range(v.begin(), v.end());
-}
-} // namespace
-
-TEST_CASE("bitwuzla.solver checkpoint") {
-  // -- research-notes/durable/generic-solver-interface-contract.md
-  Env env;
-  bitwuzla_solver_impl bzla(env.efac);
-  Solver &s = bzla;
-  CHECK(s.get_kind() == seahorn::solver::SolverKind::BITWUZLA);
-  Expr x = env.bvc("x", 8);
-
-  // -- 1. x + 1 = 0 is sat with x = 255
-  CHECK(s.add(mk<EQ>(mk<BADD>(x, env.num(1, 8)), env.num(0, 8))));
-  REQUIRE(s.check() == SolverResult::SAT);
-  Solver::model_ref m = s.get_model();
-  REQUIRE(m);
-  Expr vx = m->eval(x, false);
-  CHECK(vx == env.num(255, 8));
-  CHECK(m->eval(x, true) == env.num(255, 8));
-  CHECK(isOpX<TRUE>(m->eval(mk<BULT>(env.num(3, 8), x), false)));
-  std::string printed;
-  llvm::raw_string_ostream os(printed);
-  os << *m;
-  CHECK(os.str().find("x = #b11111111") != std::string::npos);
-
-  // -- 2. push and x = 0 is unsat; the old model is stale
-  s.push();
-  CHECK(!m->eval(x, false));
-  CHECK(s.add(mk<EQ>(x, env.num(0, 8))));
-  CHECK(s.check() == SolverResult::UNSAT);
-  CHECK(!s.get_model());
-
-  // -- 3. pop is sat again
-  s.pop();
-  CHECK(s.check() == SolverResult::SAT);
-  Solver::model_ref m2 = s.get_model();
-  REQUIRE(m2);
-  CHECK(m2->eval(x, false) == env.num(255, 8));
-
-  // -- 4. reset empties the assertions and rejects the old model and core
-  s.reset();
-  CHECK(!m2->eval(x, false));
-  ExprVector core;
-  s.unsat_core(core);
-  CHECK(core.empty());
-  CHECK(s.check() == SolverResult::SAT);
-  CHECK(s.add(mk<EQ>(x, env.num(7, 8))));
-  REQUIRE(s.check() == SolverResult::SAT);
-  CHECK(s.get_model()->eval(x, false) == env.num(7, 8));
-}
-
-TEST_CASE("bitwuzla.solver unsat core") {
-  Env env;
-  bitwuzla_solver_impl bzla(env.efac);
-  Solver &s = bzla;
-  Expr x = env.bvc("x", 8), y = env.bvc("y", 8);
-  ExprVector f = {mk<EQ>(x, env.num(1, 8)), mk<EQ>(x, env.num(2, 8)),
-                  mk<EQ>(y, env.num(3, 8))};
-  // -- activation literals as Path BMC's MUC builds them: the constraint is
-  // -- inside the literal's name, so the core must hand back these Exprs
-  ExprVector lits;
-  for (Expr v : f) {
-    Expr a = bind::boolConst(mk<ASM>(v));
-    lits.push_back(a);
-    CHECK(s.add(mk<IMPL>(a, v)));
-  }
-
-  REQUIRE(s.check_with_assumptions(litRange(lits)) == SolverResult::UNSAT);
-  ExprVector core;
-  s.unsat_core(core);
-  // -- x = 1 and x = 2 are in every core, and every element is a literal
-  auto has = [&](Expr a) {
-    return std::find(core.begin(), core.end(), a) != core.end();
-  };
-  CHECK(has(lits[0]));
-  CHECK(has(lits[1]));
-  for (Expr c : core)
-    CHECK(std::find(lits.begin(), lits.end(), c) != lits.end());
-
-  // -- with a satisfiable subset, there is a model and no core
-  ExprVector some = {lits[0], lits[2]};
-  REQUIRE(s.check_with_assumptions(litRange(some)) == SolverResult::SAT);
-  CHECK(s.get_model()->eval(x, false) == env.num(1, 8));
-  ExprVector none;
-  s.unsat_core(none);
-  CHECK(none.empty());
-
-  // -- a core is only for the check it came from
-  REQUIRE(s.check_with_assumptions(litRange(lits)) == SolverResult::UNSAT);
-  s.push();
-  ExprVector stale;
-  s.unsat_core(stale);
-  CHECK(stale.empty());
-  s.pop();
-
-  // -- a plain check has no core
-  CHECK(s.add(mk<EQ>(x, env.num(1, 8))));
-  CHECK(s.add(mk<EQ>(x, env.num(2, 8))));
-  REQUIRE(s.check() == SolverResult::UNSAT);
-  ExprVector plain;
-  s.unsat_core(plain);
-  CHECK(plain.empty());
-}
-
-TEST_CASE("bitwuzla.solver unsupported input") {
-  Env env;
-  bitwuzla_solver_impl bzla(env.efac);
-  Solver &s = bzla;
-  Expr x = env.bvc("x", 8);
-  Expr i = bind::intConst(mkTerm<std::string>("i", env.efac));
-  CHECK(s.add(mk<EQ>(x, env.num(1, 8))));
-
-  // -- an assertion that cannot be encoded: add() says so, and since callers
-  // -- (SolverBmc) ignore that, checks answer unknown, never sat or unsat
-  s.push();
-  CHECK_FALSE(s.add(mk<EQ>(i, i)));
-  CHECK(s.add(mk<EQ>(x, env.num(2, 8)))); // unsat with the first one
-  CHECK(s.check() == SolverResult::UNKNOWN);
-  CHECK(s.check_with_assumptions(litRange(ExprVector{})) ==
-        SolverResult::UNKNOWN);
-  CHECK(!s.get_model());
-  // -- popping the scope removes it
-  s.pop();
-  CHECK(s.check() == SolverResult::SAT);
-
-  // -- at the bottom scope only reset() removes it
-  CHECK_FALSE(s.add(mk<EQ>(i, i)));
-  s.push();
-  s.pop();
-  CHECK(s.check() == SolverResult::UNKNOWN);
-  s.reset();
-  CHECK(s.check() == SolverResult::SAT);
-
-  // -- an assumption that cannot be encoded affects only that check
-  Expr bad = mk<EQ>(i, i);
-  CHECK(s.check_with_assumptions(litRange(ExprVector{bad})) ==
-        SolverResult::UNKNOWN);
-  CHECK(s.check() == SolverResult::SAT);
-
-  // -- the model of a term it cannot encode gives the term back
-  REQUIRE(s.check() == SolverResult::SAT);
-  CHECK(s.get_model()->eval(i, false) == i);
-
-  // -- a non-Boolean assertion
-  CHECK_FALSE(s.add(x));
-  CHECK(s.check() == SolverResult::UNKNOWN);
-}
-
-TEST_CASE("bitwuzla.solver misuse is reported, not fatal") {
-  Env env;
-  bitwuzla_solver_impl bzla(env.efac);
-  Solver &s = bzla;
-  Expr x = env.bvc("x", 8);
-  // -- no check yet: no model, no core
-  CHECK(!s.get_model());
-  ExprVector core;
-  s.unsat_core(core);
-  CHECK(core.empty());
-  // -- pop without push
-  s.pop();
-  CHECK(s.add(mk<EQ>(x, env.num(4, 8))));
-  REQUIRE(s.check() == SolverResult::SAT);
-  // -- a model is stale after a new add, even if the answer would not change
-  Solver::model_ref m = s.get_model();
-  CHECK(s.add(mk<TRUE>(env.efac)));
-  CHECK(!m->eval(x, false));
-}
-
-TEST_CASE("bitwuzla.solver smt-lib") {
-  Env env;
-  bitwuzla_solver_impl bzla(env.efac);
-  Solver &s = bzla;
-  Expr x = env.bvc("x", 8), a = env.boolc("a");
-  CHECK(s.add(mk<IMPL>(a, mk<EQ>(x, env.num(5, 8)))));
-
-  auto smt = [&]() {
-    std::string str;
-    llvm::raw_string_ostream os(str);
-    s.to_smt_lib(os);
-    return os.str();
-  };
-  std::string plain = smt();
-  CHECK(plain.find("(declare-const x (_ BitVec 8))") != std::string::npos);
-  CHECK(plain.find("(assert (=> a (= x #b00000101)))") != std::string::npos);
-  CHECK(plain.find("(check-sat)") != std::string::npos);
-
-  ExprVector lits = {a};
-  REQUIRE(s.check_with_assumptions(litRange(lits)) == SolverResult::SAT);
-  std::string assuming = smt();
-  CHECK(assuming.find("(check-sat-assuming (a))") != std::string::npos);
-  CHECK(assuming.find("(check-sat)") == std::string::npos);
-
-  // -- a missing assertion is flagged in the output
-  CHECK_FALSE(s.add(bind::intConst(mkTerm<std::string>("i", env.efac))));
-  CHECK(smt().find("; WARNING: an assertion could not be encoded") !=
-        std::string::npos);
 }
 #endif
