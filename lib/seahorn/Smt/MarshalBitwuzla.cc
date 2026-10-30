@@ -115,12 +115,51 @@ static Kind kindOf(Expr e) {
     break;
   case OpFamilyId::BvOp:
     switch (llvm::cast<BvOp>(e->op()).m_kind) {
+    case BvOpKind::BNOT:
+      return Kind::BV_NOT;
+    // -- the result is 1 bit wide, as in Z3 (SeaHorn's type checker says
+    // -- the argument's width, but only Z3 terms converted back build these)
+    case BvOpKind::BREDAND:
+      return Kind::BV_REDAND;
+    case BvOpKind::BREDOR:
+      return Kind::BV_REDOR;
+    case BvOpKind::BAND:
+      return Kind::BV_AND;
+    case BvOpKind::BOR:
+      return Kind::BV_OR;
+    case BvOpKind::BXOR:
+      return Kind::BV_XOR;
+    case BvOpKind::BNAND:
+      return Kind::BV_NAND;
+    case BvOpKind::BNOR:
+      return Kind::BV_NOR;
+    case BvOpKind::BXNOR:
+      return Kind::BV_XNOR;
     case BvOpKind::BADD:
       return Kind::BV_ADD;
     case BvOpKind::BSUB:
       return Kind::BV_SUB;
     case BvOpKind::BNEG:
       return Kind::BV_NEG;
+    case BvOpKind::BMUL:
+      return Kind::BV_MUL;
+    // -- division and remainder by zero follow SMT-LIB in Bitwuzla and Z3
+    case BvOpKind::BUDIV:
+      return Kind::BV_UDIV;
+    case BvOpKind::BSDIV:
+      return Kind::BV_SDIV;
+    case BvOpKind::BUREM:
+      return Kind::BV_UREM;
+    case BvOpKind::BSREM:
+      return Kind::BV_SREM;
+    case BvOpKind::BSMOD:
+      return Kind::BV_SMOD;
+    case BvOpKind::BSHL:
+      return Kind::BV_SHL;
+    case BvOpKind::BLSHR:
+      return Kind::BV_SHR;
+    case BvOpKind::BASHR:
+      return Kind::BV_ASHR;
     case BvOpKind::BULT:
       return Kind::BV_ULT;
     case BvOpKind::BSLT:
@@ -145,6 +184,37 @@ static Kind kindOf(Expr e) {
       return Kind::BV_ZERO_EXTEND;
     case BvOpKind::BCONCAT:
       return Kind::BV_CONCAT;
+    case BvOpKind::BREPEAT:
+      return Kind::BV_REPEAT;
+    case BvOpKind::BROTATE_LEFT:
+      return Kind::BV_ROLI;
+    case BvOpKind::BROTATE_RIGHT:
+      return Kind::BV_RORI;
+    // -- the overflow test; mkNoOverflow adds the direction
+    case BvOpKind::UADD_NO_OVERFLOW:
+      return Kind::BV_UADD_OVERFLOW;
+    case BvOpKind::USUB_NO_UNDERFLOW:
+      return Kind::BV_USUB_OVERFLOW;
+    case BvOpKind::UMUL_NO_OVERFLOW:
+      return Kind::BV_UMUL_OVERFLOW;
+    case BvOpKind::SADD_NO_OVERFLOW:
+    case BvOpKind::SADD_NO_UNDERFLOW:
+      return Kind::BV_SADD_OVERFLOW;
+    case BvOpKind::SSUB_NO_OVERFLOW:
+    case BvOpKind::SSUB_NO_UNDERFLOW:
+      return Kind::BV_SSUB_OVERFLOW;
+    case BvOpKind::SMUL_NO_OVERFLOW:
+    case BvOpKind::SMUL_NO_UNDERFLOW:
+      return Kind::BV_SMUL_OVERFLOW;
+    case BvOpKind::INT2BV:
+    case BvOpKind::BV2INT:
+      throw UnsupportedExpr(e, "Bitwuzla has no integers");
+    // -- nothing in SeaHorn builds these, and their type rule (an unsigned
+    // -- amount) disagrees with Z3's ext_rotate (a bit-vector amount)
+    case BvOpKind::BEXT_ROTATE_LEFT:
+    case BvOpKind::BEXT_ROTATE_RIGHT:
+      throw UnsupportedExpr(e, "rotation by a term is not supported by "
+                               "Bitwuzla adapter");
     default:
       break;
     }
@@ -156,13 +226,52 @@ static Kind kindOf(Expr e) {
 }
 
 /// The children of \p e that are terms, as [first, last): (extract hi lo
-/// bv) and (sext bv sort) also have numerals and sorts as children
+/// bv), (sext bv sort), (repeat n bv) and (rotate n bv) also have numerals
+/// and sorts as children
 static std::pair<unsigned, unsigned> termArgs(Expr e) {
   if (isOpX<BEXTRACT>(e))
     return {2, 3};
   if (isOpX<BSEXT>(e) || isOpX<BZEXT>(e))
     return {0, 1};
+  if (isOpX<BREPEAT>(e) || isOpX<BROTATE_LEFT>(e) || isOpX<BROTATE_RIGHT>(e))
+    return {1, 2};
   return {0, static_cast<unsigned>(e->arity())};
+}
+
+/// SeaHorn's overflow predicates, as Z3 defines them: true when the exact
+/// result is in range. Z3 splits signed overflow by direction, while
+/// Bitwuzla's signed tests \p k are true when the result is out of range in
+/// either direction. An out-of-range signed sum or difference is too large
+/// iff the first argument is non-negative, and a product iff the signs agree.
+static Term mkNoOverflow(bitwuzla::TermManager &tm, Expr e, Kind k,
+                         const std::vector<Term> &args) {
+  Term out = tm.mk_term(k, args); // -- checks that there are two arguments
+  auto neg = [&](const Term &t) {
+    return tm.mk_term(Kind::BV_SLT, {t, tm.mk_bv_zero(t.sort())});
+  };
+  switch (llvm::cast<BvOp>(e->op()).m_kind) {
+  case BvOpKind::SADD_NO_OVERFLOW:
+  case BvOpKind::SSUB_NO_OVERFLOW:
+    out = tm.mk_term(Kind::AND, {out, tm.mk_term(Kind::NOT, {neg(args[0])})});
+    break;
+  case BvOpKind::SADD_NO_UNDERFLOW:
+  case BvOpKind::SSUB_NO_UNDERFLOW:
+    out = tm.mk_term(Kind::AND, {out, neg(args[0])});
+    break;
+  case BvOpKind::SMUL_NO_OVERFLOW:
+    out = tm.mk_term(Kind::AND, {out, tm.mk_term(Kind::EQUAL, {neg(args[0]),
+                                                               neg(args[1])})});
+    break;
+  case BvOpKind::SMUL_NO_UNDERFLOW:
+    out = tm.mk_term(
+        Kind::AND,
+        {out, tm.mk_term(Kind::DISTINCT, {neg(args[0]), neg(args[1])})});
+    break;
+  default:
+    // -- unsigned: only one direction is possible
+    break;
+  }
+  return tm.mk_term(Kind::NOT, {out});
 }
 
 Sort marshal_bitwuzla::encode_sort(Expr s) {
@@ -231,10 +340,27 @@ Term marshal_bitwuzla::mkNode(Expr e, const std::vector<Term> &args) {
         return args[0];
       return m_tm.mk_term(k, args, {out_width - in_width});
     }
+    case Kind::BV_REPEAT:
+    case Kind::BV_ROLI:
+    case Kind::BV_RORI:
+      if (!isOpX<UINT>(e->arg(0)))
+        throw UnsupportedExpr(e, "expected an unsigned numeral as index");
+      return m_tm.mk_term(k, args, {getTerm<unsigned>(e->arg(0))});
+    case Kind::BV_UADD_OVERFLOW:
+    case Kind::BV_USUB_OVERFLOW:
+    case Kind::BV_UMUL_OVERFLOW:
+    case Kind::BV_SADD_OVERFLOW:
+    case Kind::BV_SSUB_OVERFLOW:
+    case Kind::BV_SMUL_OVERFLOW:
+      return mkNoOverflow(m_tm, e, k, args);
     case Kind::AND:
     case Kind::OR:
     case Kind::XOR:
+    case Kind::BV_AND:
+    case Kind::BV_OR:
+    case Kind::BV_XOR:
     case Kind::BV_ADD:
+    case Kind::BV_MUL:
     case Kind::BV_CONCAT:
       // -- n-ary in both, but Bitwuzla wants at least two arguments
       if (args.size() == 1)

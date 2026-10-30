@@ -6,8 +6,12 @@
 #include "seahorn/Expr/ExprLlvm.hh"
 #include "seahorn/Expr/ExprOpBinder.hh"
 #include "seahorn/Expr/Smt/BitwuzlaSolverImpl.hh"
+#include "seahorn/Expr/Smt/EZ3.hh"
 #include "seahorn/Expr/Smt/MarshalBitwuzla.hh"
 
+#include "boost/lexical_cast.hpp"
+
+#include <functional>
 #include <string>
 
 #include "sea_doctest.hh" // doctest is last to avoid name clash
@@ -59,6 +63,19 @@ struct Env {
     return false;
   }
 };
+
+using BinOp = std::function<Expr(Expr, Expr)>;
+template <typename Op> BinOp binop() {
+  return [](Expr a, Expr b) { return mk<Op>(a, b); };
+}
+
+/// Z3's value of a variable-free \p t (through the existing EZ3 path)
+Expr z3Value(EZ3 &z3, Expr t, Expr r) {
+  ZSolver<EZ3> solver(z3);
+  solver.assertExpr(mk<EQ>(r, t));
+  REQUIRE(bool(solver.solve()));
+  return solver.getModel().eval(r);
+}
 } // namespace
 
 TEST_CASE("bitwuzla.sorts") {
@@ -155,17 +172,214 @@ TEST_CASE("bitwuzla.bit-vector operators") {
                        env.num(5, 3))));
 }
 
+TEST_CASE("bitwuzla.bit-vector operators agree with z3") {
+  Env env;
+  EZ3 z3(env.efac);
+  const unsigned w = 3;
+
+  // -- division and remainder by zero are included: both follow SMT-LIB
+  // -- names are std::string: doctest prints a const char * as a pointer
+  std::vector<std::pair<std::string, BinOp>> ops = {
+      {"bvand", binop<BAND>()},
+      {"bvor", binop<BOR>()},
+      {"bvxor", binop<BXOR>()},
+      {"bvnand", binop<BNAND>()},
+      {"bvnor", binop<BNOR>()},
+      {"bvxnor", binop<BXNOR>()},
+      {"bvadd", binop<BADD>()},
+      {"bvsub", binop<BSUB>()},
+      {"bvmul", binop<BMUL>()},
+      {"bvudiv", binop<BUDIV>()},
+      {"bvsdiv", binop<BSDIV>()},
+      {"bvurem", binop<BUREM>()},
+      {"bvsrem", binop<BSREM>()},
+      {"bvsmod", binop<BSMOD>()},
+      {"bvshl", binop<BSHL>()},
+      {"bvlshr", binop<BLSHR>()},
+      {"bvashr", binop<BASHR>()},
+      {"concat", binop<BCONCAT>()},
+      {"bvult", binop<BULT>()},
+      {"bvslt", binop<BSLT>()},
+      {"bvule", binop<BULE>()},
+      {"bvsle", binop<BSLE>()},
+      {"bvuge", binop<BUGE>()},
+      {"bvsge", binop<BSGE>()},
+      {"bvugt", binop<BUGT>()},
+      {"bvsgt", binop<BSGT>()},
+      {"=", binop<EQ>()},
+      {"distinct", binop<NEQ>()},
+      // -- unary operators, applied to the first argument
+      {"bvnot", [](Expr a, Expr) { return mk<BNOT>(a); }},
+      {"bvneg", [](Expr a, Expr) { return mk<BNEG>(a); }},
+      {"bvredand", [](Expr a, Expr) { return mk<BREDAND>(a); }},
+      {"bvredor", [](Expr a, Expr) { return mk<BREDOR>(a); }},
+      {"extract", [](Expr a, Expr) { return bv::extract(2, 1, a); }},
+      {"sext", [](Expr a, Expr) { return bv::sext(a, 5); }},
+      {"zext", [](Expr a, Expr) { return bv::zext(a, 5); }},
+  };
+
+  bz::Bitwuzla bzla(env.tm);
+  unsigned checked = 0, disagreements = 0;
+  for (auto &op : ops) {
+    for (long a = 0; a < (1 << w); ++a) {
+      for (long b = 0; b < (1 << w); ++b) {
+        Expr t = op.second(env.num(a, w), env.num(b, w));
+        // -- the sort of the result, as Bitwuzla sees it
+        bz::Sort s = env.m.encode_term(t).sort();
+        Expr r = s.is_bool() ? env.boolc("r") : env.bvc("r", s.bv_size());
+        Expr expected = z3Value(z3, t, r);
+
+        bzla.push(1);
+        bzla.assert_formula(env.m.encode_term(mk<NEQ>(t, expected)));
+        bool agrees = bzla.check_sat() == bz::Result::UNSAT;
+        bzla.pop(1);
+        ++checked;
+        if (!agrees) {
+          ++disagreements;
+          MESSAGE(op.first << " " << a << " " << b << ": z3 says "
+                           << boost::lexical_cast<std::string>(*expected));
+        }
+      }
+    }
+  }
+  CHECK(checked == ops.size() * 64);
+  CHECK(disagreements == 0);
+}
+
+TEST_CASE("bitwuzla.overflow predicates agree with z3 and with arithmetic") {
+  Env env;
+  EZ3 z3(env.efac);
+
+  // -- expected truth value from exact integer arithmetic, given a and b as
+  // -- signed and as unsigned values, and the width
+  struct Pred {
+    std::string name;
+    BinOp mkop;
+    std::function<bool(long, long, long, long, unsigned)> exact;
+  };
+  auto smin = [](unsigned w) { return -(1L << (w - 1)); };
+  auto smax = [](unsigned w) { return (1L << (w - 1)) - 1; };
+  auto umax = [](unsigned w) { return (1L << w) - 1; };
+  std::vector<Pred> preds = {
+      {"uadd_no_overflow", binop<UADD_NO_OVERFLOW>(),
+       [&](long, long, long ua, long ub, unsigned w) {
+         return ua + ub <= umax(w);
+       }},
+      {"usub_no_underflow", binop<USUB_NO_UNDERFLOW>(),
+       [&](long, long, long ua, long ub, unsigned) { return ua - ub >= 0; }},
+      {"umul_no_overflow", binop<UMUL_NO_OVERFLOW>(),
+       [&](long, long, long ua, long ub, unsigned w) {
+         return ua * ub <= umax(w);
+       }},
+      {"sadd_no_overflow", binop<SADD_NO_OVERFLOW>(),
+       [&](long sa, long sb, long, long, unsigned w) {
+         return sa + sb <= smax(w);
+       }},
+      {"sadd_no_underflow", binop<SADD_NO_UNDERFLOW>(),
+       [&](long sa, long sb, long, long, unsigned w) {
+         return sa + sb >= smin(w);
+       }},
+      {"ssub_no_overflow", binop<SSUB_NO_OVERFLOW>(),
+       [&](long sa, long sb, long, long, unsigned w) {
+         return sa - sb <= smax(w);
+       }},
+      {"ssub_no_underflow", binop<SSUB_NO_UNDERFLOW>(),
+       [&](long sa, long sb, long, long, unsigned w) {
+         return sa - sb >= smin(w);
+       }},
+      {"smul_no_overflow", binop<SMUL_NO_OVERFLOW>(),
+       [&](long sa, long sb, long, long, unsigned w) {
+         return sa * sb <= smax(w);
+       }},
+      {"smul_no_underflow", binop<SMUL_NO_UNDERFLOW>(),
+       [&](long sa, long sb, long, long, unsigned w) {
+         return sa * sb >= smin(w);
+       }},
+  };
+
+  bz::Bitwuzla bzla(env.tm);
+  unsigned checked = 0, z3_wrong = 0, bzla_wrong = 0;
+  for (unsigned w = 1; w <= 4; ++w) {
+    for (auto &p : preds) {
+      for (long ua = 0; ua <= umax(w); ++ua) {
+        for (long ub = 0; ub <= umax(w); ++ub) {
+          long sa = ua > smax(w) ? ua - (1L << w) : ua;
+          long sb = ub > smax(w) ? ub - (1L << w) : ub;
+          bool expected = p.exact(sa, sb, ua, ub, w);
+          Expr t = p.mkop(env.num(ua, w), env.num(ub, w));
+
+          ZSolver<EZ3> solver(z3);
+          solver.assertExpr(t);
+          bool z3_says = bool(solver.solve());
+
+          bzla.push(1);
+          bzla.assert_formula(env.m.encode_term(t));
+          bool bzla_says = bzla.check_sat() == bz::Result::SAT;
+          bzla.pop(1);
+
+          ++checked;
+          if (z3_says != expected) {
+            ++z3_wrong;
+            MESSAGE("z3 " << p.name << " w=" << w << " " << sa << " " << sb);
+          }
+          if (bzla_says != expected) {
+            ++bzla_wrong;
+            MESSAGE("bitwuzla " << p.name << " w=" << w << " " << sa << " "
+                                << sb);
+          }
+        }
+      }
+    }
+  }
+  // -- 9 predicates x (4 + 16 + 64 + 256) argument pairs
+  CHECK(checked == 9 * 340);
+  CHECK(z3_wrong == 0);
+  CHECK(bzla_wrong == 0);
+}
+
+TEST_CASE("bitwuzla.repeat, rotate and n-ary operators") {
+  // -- Z3's marshal has no repeat or rotate, so these check exact values
+  Env env;
+  auto u = [&](unsigned n) { return mkTerm<unsigned>(n, env.efac); };
+  Expr x81 = env.num(0x81, 8);
+  CHECK(
+      env.valid(mk<EQ>(mk<BREPEAT>(u(2), env.num(0xA, 4)), env.num(0xAA, 8))));
+  CHECK(env.valid(mk<EQ>(mk<BROTATE_LEFT>(u(1), x81), env.num(0x03, 8))));
+  CHECK(env.valid(mk<EQ>(mk<BROTATE_RIGHT>(u(1), x81), env.num(0xC0, 8))));
+  // -- rotating by the width or more wraps around
+  CHECK(env.valid(mk<EQ>(mk<BROTATE_LEFT>(u(8), x81), x81)));
+  CHECK(env.valid(mk<EQ>(mk<BROTATE_LEFT>(u(9), x81), env.num(0x03, 8))));
+
+  // -- n-ary forms of the associative operators
+  Expr x = env.bvc("x", 8), y = env.bvc("y", 8), z = env.bvc("z", 8);
+  CHECK(env.valid(
+      mk<EQ>(mknary<BMUL>(ExprVector{x, y, z}), mk<BMUL>(x, mk<BMUL>(y, z)))));
+  CHECK(env.valid(
+      mk<EQ>(mknary<BAND>(ExprVector{x, y, z}), mk<BAND>(x, mk<BAND>(y, z)))));
+  CHECK(env.valid(
+      mk<EQ>(mknary<BOR>(ExprVector{x, y, z}), mk<BOR>(x, mk<BOR>(y, z)))));
+  CHECK(env.valid(
+      mk<EQ>(mknary<BXOR>(ExprVector{x, y, z}), mk<BXOR>(x, mk<BXOR>(y, z)))));
+  // -- the others take two arguments in Bitwuzla
+  Expr sub3 = mknary<BSUB>(ExprVector{x, y, z});
+  CHECK(env.rejects(mk<EQ>(sub3, x), sub3));
+}
+
 TEST_CASE("bitwuzla.unsupported") {
   Env env;
   Expr x = env.bvc("x", 8);
+  Expr i = bind::intConst(mkTerm<std::string>("i", env.efac));
 
   // -- the error names the unsupported operator, not one of its arguments
-  Expr mul = mk<BMUL>(x, x);
-  CHECK(env.rejects(mk<AND>(mk<EQ>(x, x), mk<BULT>(mul, x)), mul));
+  Expr i2b = mk<INT2BV>(mkTerm<unsigned>(8, env.efac), i);
+  CHECK(env.rejects(mk<AND>(mk<EQ>(x, x), mk<BULT>(i2b, x)), i2b));
+  Expr b2i = mk<BV2INT>(x);
+  CHECK(env.rejects(mk<EQ>(b2i, b2i), b2i));
+  Expr rot = mk<BEXT_ROTATE_LEFT>(x, env.num(1, 8));
+  CHECK(env.rejects(mk<EQ>(rot, x), rot));
   Expr leq = mk<LEQ>(x, x);
   CHECK(env.rejects(mk<OR>(leq, mk<EQ>(x, x)), leq));
   // -- constants of unsupported sorts: integers, arrays (plan 1.6)
-  Expr i = bind::intConst(mkTerm<std::string>("i", env.efac));
   CHECK(env.rejects(mk<EQ>(i, i), i));
   Expr A = bind::mkConst(mkTerm<std::string>("A", env.efac),
                          sort::arrayTy(env.bvsort(8), env.bvsort(8)));
@@ -188,13 +402,13 @@ TEST_CASE("bitwuzla.unsupported") {
   Expr big = x;
   for (unsigned k = 0; k < 64; ++k)
     big = mk<BADD>(big, big);
-  Expr bigmul = mk<BMUL>(big, x);
+  Expr bigrot = mk<BEXT_ROTATE_LEFT>(big, x);
   try {
-    env.m.encode_term(mk<EQ>(bigmul, x));
-    FAIL("bvmul is not supported");
+    env.m.encode_term(mk<EQ>(bigrot, x));
+    FAIL("rotation by a term is not supported");
   } catch (UnsupportedExpr &ex) {
-    CHECK(ex.expr() == bigmul);
-    CHECK(std::string(ex.what()).find("bvmul(bvadd(...), x)") !=
+    CHECK(ex.expr() == bigrot);
+    CHECK(std::string(ex.what()).find("bvextrotleft(bvadd(...), x)") !=
           std::string::npos);
   }
 }
@@ -244,7 +458,8 @@ TEST_CASE("bitwuzla.solver unsupported input") {
 
   // -- an assertion that cannot be encoded: add() says so, and since callers
   // -- (SolverBmc) ignore that, checks answer unknown, never sat or unsat
-  CHECK_FALSE(s.add(mk<EQ>(mk<BMUL>(x, x), env.num(1, 8))));
+  Expr i = bind::intConst(mkTerm<std::string>("i", env.efac));
+  CHECK_FALSE(s.add(mk<EQ>(mk<BV2INT>(x), i)));
   CHECK(s.check() == SolverResult::UNKNOWN);
   CHECK(s.add(mk<EQ>(x, env.num(2, 8)))); // unsat with the first one
   CHECK(s.check() == SolverResult::UNKNOWN);

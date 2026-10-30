@@ -25,9 +25,9 @@ public:
 /// \brief Encodes Exprs as Bitwuzla terms of a given TermManager
 ///
 /// Supports Bool and bit-vector constants and numerals, the Boolean
-/// operators, equality, and the common bit-vector operators (add, sub, neg,
-/// comparisons, extract, extend, concat). Everything else throws
-/// UnsupportedExpr.
+/// operators, equality, and the bit-vector operators, including the overflow
+/// predicates. Everything else throws UnsupportedExpr, among it int2bv,
+/// bv2int and rotation by a term.
 ///
 /// Results are cached, so encoding the same Expr twice returns the same
 /// term, and every SeaHorn constant becomes exactly one Bitwuzla constant.
